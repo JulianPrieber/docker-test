@@ -1,9 +1,6 @@
 name: Dedicated deploy worker
 
 on:
-  push:
-    tags:
-      - '*-test'
   repository_dispatch:
     types:
       - linkstack-release
@@ -19,11 +16,6 @@ on:
         options:
           - day
           - month
-      test_release:
-        description: 'Publish an upstream-version-test tag and use channel x'
-        required: false
-        default: false
-        type: boolean
       docker_tag:
         description: 'Optional complete Docker tag override'
         required: false
@@ -91,20 +83,12 @@ jobs:
           set -euo pipefail
 
           EVENT_NAME="${{ github.event_name }}"
-          TEST_RELEASE="false"
           CHANNEL="b"
 
           if [[ "${EVENT_NAME}" == "schedule" ]]; then
             CHANNEL="a"
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             CHANNEL="c"
-            TEST_RELEASE="${{ github.event.inputs.test_release }}"
-            if [[ "${TEST_RELEASE}" == "true" ]]; then
-              CHANNEL="x"
-            fi
-          elif [[ "${EVENT_NAME}" == "push" ]]; then
-            CHANNEL="x"
-            TEST_RELEASE="true"
           elif [[ "${EVENT_NAME}" == "repository_dispatch" ]]; then
             CHANNEL="b"
           fi
@@ -123,8 +107,6 @@ jobs:
             RELEASE_TAG="${{ github.event.client_payload.release_tag || github.event.client_payload.tag_name }}"
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.upstream_release_tag }}" ]]; then
             RELEASE_TAG="${{ github.event.inputs.upstream_release_tag }}"
-          elif [[ "${EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" == *-test ]]; then
-            RELEASE_TAG="${GITHUB_REF_NAME%-test}"
           else
             RELEASE_TAG="$(curl -fsSL https://api.github.com/repos/${LINKSTACK_REPO}/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
           fi
@@ -134,9 +116,9 @@ jobs:
           fi
 
           if [[ "${DOCKER_TAG}" != *[0-9] ]]; then
-            if [[ "${DOCKER_TAG}" == *-a || "${DOCKER_TAG}" == *-b || "${DOCKER_TAG}" == *-c || "${DOCKER_TAG}" == *-x ]]; then
+            if [[ "${DOCKER_TAG}" == *-a || "${DOCKER_TAG}" == *-b || "${DOCKER_TAG}" == *-c ]]; then
               TAG_PREFIX="${DOCKER_TAG}"
-              if [[ "${DOCKER_TAG}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[abcx]$ ]]; then
+              if [[ "${DOCKER_TAG}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[abc]$ ]]; then
                 COUNTER_WIDTH=2
               else
                 COUNTER_WIDTH=3
@@ -148,18 +130,11 @@ jobs:
             fi
           fi
 
-          TEST_TAG=""
-          if [[ "${TEST_RELEASE}" == "true" ]]; then
-            TEST_TAG="${RELEASE_TAG}-test"
-          fi
-
           echo "docker_tag=${DOCKER_TAG}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "test_tag=${TEST_TAG}" >> "$GITHUB_OUTPUT"
           echo "Docker tag: ${DOCKER_TAG}"
           echo "Upstream release tag: ${RELEASE_TAG}"
           echo "Docker repository: ${DOCKER_REPO}"
-          echo "Test tag: ${TEST_TAG:-none}"
 
       - name: Download LinkStack release zip
         shell: bash
@@ -230,7 +205,6 @@ jobs:
         shell: bash
         env:
           DOCKER_TAG: ${{ steps.tags.outputs.docker_tag }}
-          TEST_TAG: ${{ steps.tags.outputs.test_tag }}
         run: |
           set -euo pipefail
 
@@ -240,13 +214,6 @@ jobs:
             --tag "${DOCKER_IMAGE}:latest"
             --tag "${GHCR_IMAGE}:latest"
           )
-
-          if [[ -n "${TEST_TAG}" ]]; then
-            TAG_ARGS+=(
-              --tag "${DOCKER_IMAGE}:${TEST_TAG}"
-              --tag "${GHCR_IMAGE}:${TEST_TAG}"
-            )
-          fi
 
           docker buildx build \
             --platform linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64 \
@@ -258,9 +225,5 @@ jobs:
         shell: bash
         env:
           DOCKER_TAG: ${{ steps.tags.outputs.docker_tag }}
-          TEST_TAG: ${{ steps.tags.outputs.test_tag }}
         run: |
           echo "Published ${DOCKER_IMAGE}:${DOCKER_TAG} and ${DOCKER_IMAGE}:latest to Docker Hub and GHCR."
-          if [[ -n "${TEST_TAG}" ]]; then
-            echo "Published test tag ${DOCKER_IMAGE}:${TEST_TAG}."
-          fi
