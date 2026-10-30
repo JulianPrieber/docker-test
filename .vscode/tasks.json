@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Docker autotest",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"./autotest.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

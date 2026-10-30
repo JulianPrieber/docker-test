@@ -1,0 +1,266 @@
+name: Dedicated deploy worker
+
+on:
+  push:
+    tags:
+      - '*-test'
+  repository_dispatch:
+    types:
+      - linkstack-release
+  schedule:
+    - cron: '0 6 * * 0'
+  workflow_dispatch:
+    inputs:
+      date_granularity:
+        description: 'Use a daily or monthly counter prefix'
+        required: false
+        default: day
+        type: choice
+        options:
+          - day
+          - month
+      test_release:
+        description: 'Publish an upstream-version-test tag and use channel x'
+        required: false
+        default: false
+        type: boolean
+      docker_tag:
+        description: 'Optional complete Docker tag override'
+        required: false
+        type: string
+      upstream_release_tag:
+        description: 'Optional upstream LinkStack release tag override'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DOCKER_REPO: LinkStackOrg/LinkStack-docker
+  LINKSTACK_REPO: LinkStackOrg/LinkStack
+  DOCKER_IMAGE: linkstackorg/linkstack
+  GHCR_IMAGE: ghcr.io/linkstackorg/linkstack
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  GHCR_USERNAME: ${{ github.actor }}
+  GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DOCKERHUB_USERNAME}" ]]; then
+            echo 'Missing required secret: DOCKERHUB_USERNAME' >&2
+            exit 1
+          fi
+
+          if [[ -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo 'Missing required secret: DOCKERHUB_TOKEN' >&2
+            exit 1
+          fi
+
+          if [[ -z "${GHCR_TOKEN}" ]]; then
+            echo 'GitHub token is unavailable; packages:write cannot authenticate to GHCR.' >&2
+            exit 1
+          fi
+
+          echo 'Docker Hub and GHCR credentials are available.'
+
+      - name: Resolve release and docker tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EVENT_NAME="${{ github.event_name }}"
+          TEST_RELEASE="false"
+          CHANNEL="b"
+
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            CHANNEL="a"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            CHANNEL="c"
+            TEST_RELEASE="${{ github.event.inputs.test_release }}"
+            if [[ "${TEST_RELEASE}" == "true" ]]; then
+              CHANNEL="x"
+            fi
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            CHANNEL="x"
+            TEST_RELEASE="true"
+          elif [[ "${EVENT_NAME}" == "repository_dispatch" ]]; then
+            CHANNEL="b"
+          fi
+
+          if [[ "${EVENT_NAME}" == "repository_dispatch" ]] && [[ -n "${{ github.event.client_payload.docker_tag || github.event.client_payload.version_tag }}" ]]; then
+            DOCKER_TAG="${{ github.event.client_payload.docker_tag || github.event.client_payload.version_tag }}"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.docker_tag }}" ]]; then
+            DOCKER_TAG="${{ github.event.inputs.docker_tag }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.date_granularity }}" == "month" ]]; then
+            DOCKER_TAG="$(date -u +%Y-%m)-${CHANNEL}"
+          else
+            DOCKER_TAG="$(date -u +%Y-%m-%d)-${CHANNEL}"
+          fi
+
+          if [[ "${EVENT_NAME}" == "repository_dispatch" ]]; then
+            RELEASE_TAG="${{ github.event.client_payload.release_tag || github.event.client_payload.tag_name }}"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.upstream_release_tag }}" ]]; then
+            RELEASE_TAG="${{ github.event.inputs.upstream_release_tag }}"
+          elif [[ "${EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" == *-test ]]; then
+            RELEASE_TAG="${GITHUB_REF_NAME%-test}"
+          else
+            RELEASE_TAG="$(curl -fsSL https://api.github.com/repos/${LINKSTACK_REPO}/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          fi
+
+          if [[ -z "${RELEASE_TAG}" ]]; then
+            RELEASE_TAG="$(curl -fsSL https://api.github.com/repos/${LINKSTACK_REPO}/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          fi
+
+          if [[ "${DOCKER_TAG}" != *[0-9] ]]; then
+            if [[ "${DOCKER_TAG}" == *-a || "${DOCKER_TAG}" == *-b || "${DOCKER_TAG}" == *-c || "${DOCKER_TAG}" == *-x ]]; then
+              TAG_PREFIX="${DOCKER_TAG}"
+              if [[ "${DOCKER_TAG}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[abcx]$ ]]; then
+                COUNTER_WIDTH=2
+              else
+                COUNTER_WIDTH=3
+              fi
+
+              EXISTING_TAGS="$(curl -fsSL "https://hub.docker.com/v2/repositories/${DOCKER_IMAGE}/tags?page_size=100" | python3 -c 'import json,sys; print("\n".join(item["name"] for item in json.load(sys.stdin).get("results", [])))')"
+              NEXT_COUNTER="$(TAG_PREFIX="${TAG_PREFIX}" printf '%s\n' "${EXISTING_TAGS}" | TAG_PREFIX="${TAG_PREFIX}" python3 -c 'import os,re,sys; prefix=re.escape(os.environ["TAG_PREFIX"]); values=[int(m.group(1)) for line in sys.stdin if (m:=re.fullmatch(prefix+r"([0-9]+)", line.strip()))]; print(max(values, default=0)+1)')"
+              DOCKER_TAG="${TAG_PREFIX}$(printf "%0*d" "${COUNTER_WIDTH}" "${NEXT_COUNTER}")"
+            fi
+          fi
+
+          TEST_TAG=""
+          if [[ "${TEST_RELEASE}" == "true" ]]; then
+            TEST_TAG="${RELEASE_TAG}-test"
+          fi
+
+          echo "docker_tag=${DOCKER_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "test_tag=${TEST_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Docker tag: ${DOCKER_TAG}"
+          echo "Upstream release tag: ${RELEASE_TAG}"
+          echo "Docker repository: ${DOCKER_REPO}"
+          echo "Test tag: ${TEST_TAG:-none}"
+
+      - name: Download LinkStack release zip
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tags.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p .tmp
+
+          if [[ -n "${RELEASE_TAG}" && "${RELEASE_TAG}" != "latest" ]]; then
+            curl -fsSL "https://github.com/${LINKSTACK_REPO}/releases/download/${RELEASE_TAG}/linkstack.zip" -o .tmp/linkstack.zip
+          else
+            curl -fsSL "https://github.com/${LINKSTACK_REPO}/releases/latest/download/linkstack.zip" -o .tmp/linkstack.zip
+          fi
+
+          ls -lh .tmp
+
+      - name: Populate app files into build context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf linkstack
+          mkdir -p linkstack
+
+          python3 - <<'PY'
+          import os
+          import zipfile
+
+          root = os.getcwd()
+          zip_path = os.path.join(root, '.tmp', 'linkstack.zip')
+          extract_dir = os.path.join(root, 'linkstack')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              for member in archive.infolist():
+                  if member.is_dir() or not member.filename.startswith('linkstack/'):
+                      continue
+
+                  relative_path = member.filename[len('linkstack/'):]
+                  if not relative_path:
+                      continue
+
+                  target_path = os.path.join(extract_dir, relative_path)
+                  os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+                  with archive.open(member) as src, open(target_path, 'wb') as dst:
+                      dst.write(src.read())
+          PY
+
+          echo 'Built app payload into linkstack/'
+          find linkstack -maxdepth 2 -type f | head -n 20
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ env.GHCR_USERNAME }}
+          password: ${{ env.GHCR_TOKEN }}
+
+      - name: Build and push multi-arch image
+        shell: bash
+        env:
+          DOCKER_TAG: ${{ steps.tags.outputs.docker_tag }}
+          TEST_TAG: ${{ steps.tags.outputs.test_tag }}
+        run: |
+          set -euo pipefail
+
+          TAG_ARGS=(
+            --tag "${DOCKER_IMAGE}:${DOCKER_TAG}"
+            --tag "${GHCR_IMAGE}:${DOCKER_TAG}"
+            --tag "${DOCKER_IMAGE}:latest"
+            --tag "${GHCR_IMAGE}:latest"
+          )
+
+          if [[ -n "${TEST_TAG}" ]]; then
+            TAG_ARGS+=(
+              --tag "${DOCKER_IMAGE}:${TEST_TAG}"
+              --tag "${GHCR_IMAGE}:${TEST_TAG}"
+            )
+          fi
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64 \
+            "${TAG_ARGS[@]}" \
+            --push \
+            .
+
+      - name: Final status
+        shell: bash
+        env:
+          DOCKER_TAG: ${{ steps.tags.outputs.docker_tag }}
+          TEST_TAG: ${{ steps.tags.outputs.test_tag }}
+        run: |
+          echo "Published ${DOCKER_IMAGE}:${DOCKER_TAG} and ${DOCKER_IMAGE}:latest to Docker Hub and GHCR."
+          if [[ -n "${TEST_TAG}" ]]; then
+            echo "Published test tag ${DOCKER_IMAGE}:${TEST_TAG}."
+          fi
